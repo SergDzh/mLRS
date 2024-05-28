@@ -74,6 +74,7 @@
 #include "../Common/common.h"
 #include "../Common/channel_order.h"
 #include "../Common/diversity.h"
+#include "../Common/arq.h"
 //#include "../Common/test.h" // un-comment if you want to compile for board test
 
 #include "txstats.h"
@@ -87,6 +88,7 @@
 tTxStats txstats;
 tRDiversity rdiversity;
 tTDiversity tdiversity;
+tReceiveArq rarq;
 ChannelOrder channelOrder(ChannelOrder::DIRECTION_TX_TO_MLRS);
 tConfigId config_id;
 tTxCli cli;
@@ -438,7 +440,7 @@ uint8_t payload_len = 0;
 
     tFrameStats frame_stats;
     frame_stats.seq_no = stats.transmit_seq_no;
-    frame_stats.ack = 1;
+    frame_stats.ack = rarq.AckSeqNo();
     frame_stats.antenna = stats.last_antenna;
     frame_stats.transmit_antenna = antenna;
     frame_stats.rssi = stats.GetLastRssi();
@@ -450,11 +452,22 @@ uint8_t payload_len = 0;
     } else {
         pack_txcmdframe(&txFrame, &frame_stats, &rcData);
     }
+
+#ifdef USE_ARQ
+dbg.puts("\ntrs ");
+dbg.puts(u8toBCD_s(rarq.AckSeqNo()));
+#endif
 }
 
 
 void process_received_frame(bool do_payload, tRxFrame* frame)
 {
+    bool accept_payload = rarq.AcceptPayload();
+
+#ifdef USE_ARQ
+dbg.puts(accept_payload?" TRUE":" FALSE");
+#endif
+
     stats.received_antenna = frame->status.antenna;
     stats.received_transmit_antenna = frame->status.transmit_antenna;
     stats.received_rssi = rssi_i8_from_u7(frame->status.rssi_u7);
@@ -462,6 +475,8 @@ void process_received_frame(bool do_payload, tRxFrame* frame)
     stats.received_LQ_serial = frame->status.LQ_serial;
 
     if (!do_payload) return; // always true
+
+    if (!accept_payload) return;
 
     if (frame->status.frame_type == FRAME_TYPE_TX_RX_CMD) {
         process_received_rxcmdframe(frame);
@@ -505,6 +520,22 @@ tRxFrame* frame;
         FAIL_WSTATE(BLINK_4, "rx_status failure", 0,0, link_rx1_status, link_rx2_status);
     }
 
+    // receive ARQ, must come before process_received_frame()
+    if (rx_status == RX_STATUS_VALID) {
+         rarq.Received(frame->status.seq_no);
+    } else {
+        rarq.FrameMissed();
+    }
+
+#ifdef USE_ARQ
+dbg.puts("\nrec");
+if(rarq.status==tReceiveArq::ARQ_RX_FRAME_MISSED) dbg.puts(" FM"); else
+if(rarq.status==tReceiveArq::ARQ_RX_RECEIVED_WAS_IDLE) dbg.puts(" RI"); else
+if(rarq.status==tReceiveArq::ARQ_RX_RECEIVED) dbg.puts(" R");
+dbg.puts(" seq_last ");dbg.puts(u8toBCD_s(rarq.received_seq_no_last));
+dbg.puts(" seq ");dbg.puts(u8toBCD_s(rarq.received_seq_no));
+#endif
+
     if (rx_status > RX_STATUS_INVALID) { // RX_STATUS_VALID
         bool do_payload = true;
 
@@ -525,6 +556,11 @@ tRxFrame* frame;
 
 void handle_receive_none(void) // RX_STATUS_NONE
 {
+    rarq.FrameMissed();
+
+#ifdef USE_ARQ
+dbg.puts("\nrec FMISSED");
+#endif
 }
 
 
@@ -649,6 +685,7 @@ RESTARTCONTROLLER
     txstats.Init(Config.LQAveragingPeriod);
     rdiversity.Init();
     tdiversity.Init(Config.frame_rate_ms);
+    rarq.Init();
 
     in.Configure(Setup.Tx[Config.ConfigId].InMode);
     mavlink.Init(&serial, &mbridge, &serial2); // ports selected by SerialDestination, ChannelsSource
@@ -825,6 +862,12 @@ IF_SX2(
         sx.SetToIdle();
         sx2.SetToIdle();
 
+#if USE_ARQ_TX_SIM_MISS > 0 && defined USE_ARQ
+static uint8_t miss_cnt = 0;
+DECc(miss_cnt,USE_ARQ_TX_SIM_MISS);
+if(!miss_cnt) { link_rx1_status = link_rx2_status = RX_STATUS_NONE; }
+#endif
+
         bool frame_received, valid_frame_received;
         if (USE_ANTENNA1 && USE_ANTENNA2) {
             frame_received = (link_rx1_status > RX_STATUS_NONE) || (link_rx2_status > RX_STATUS_NONE);
@@ -912,6 +955,8 @@ IF_SX2(
         link_state = LINK_STATE_TRANSMIT;
         link_rx1_status = RX_STATUS_NONE;
         link_rx2_status = RX_STATUS_NONE;
+
+        if (!connected()) rarq.Disconnected();
 
         if (connect_state == CONNECT_STATE_LISTEN) {
             link_task_reset(); // to ensure that the following set is enforced

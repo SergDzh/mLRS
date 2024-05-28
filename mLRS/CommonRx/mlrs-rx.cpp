@@ -94,6 +94,7 @@
 #include "../Common/setup.h"
 #include "../Common/common.h"
 #include "../Common/diversity.h"
+#include "../Common/arq.h"
 //#include "../Common/test.h" // un-comment if you want to compile for board test
 
 #include "rxstats.h"
@@ -105,6 +106,7 @@ PowerupCounterBase powerup;
 tRxStats rxstats;
 tRDiversity rdiversity;
 tTDiversity tdiversity;
+tTransmitArq tarq;
 
 
 // is required in bind.h
@@ -288,9 +290,13 @@ void prepare_transmit_frame(uint8_t antenna)
 {
 uint8_t payload[FRAME_RX_PAYLOAD_LEN];
 uint8_t payload_len = 0;
+static bool rxFrame_valid = false;
+
+    bool get_fresh_payload = tarq.GetFreshPayload();
+
+if (get_fresh_payload) {
 
     if (transmit_frame_type == TRANSMIT_FRAME_TYPE_NORMAL) {
-
         // read data from serial
         if (connected()) {
             for (uint8_t i = 0; i < FRAME_RX_PAYLOAD_LEN; i++) {
@@ -309,8 +315,8 @@ uint8_t payload_len = 0;
     stats.last_transmit_antenna = antenna;
 
     tFrameStats frame_stats;
-    frame_stats.seq_no = stats.transmit_seq_no;
-    frame_stats.ack = 1;
+    frame_stats.seq_no = tarq.SeqNo();
+    frame_stats.ack = 1; // TODO
     frame_stats.antenna = stats.last_antenna;
     frame_stats.transmit_antenna = antenna;
     frame_stats.rssi = stats.GetLastRssi();
@@ -322,6 +328,34 @@ uint8_t payload_len = 0;
     } else {
         pack_rxcmdframe(&rxFrame, &frame_stats);
     }
+
+    rxFrame_valid = true;
+
+} else {
+
+    // rxFrame should still hold the previous data
+
+    if (!rxFrame_valid) while(1){} // should not happen
+
+    stats.last_transmit_antenna = antenna;
+
+    tFrameStats frame_stats;
+    frame_stats.seq_no = tarq.SeqNo(); // should be equal to rxFrame_last.status.seq_no
+    frame_stats.ack = 1; // TODO
+    frame_stats.antenna = stats.last_antenna;
+    frame_stats.transmit_antenna = antenna;
+    frame_stats.rssi = stats.GetLastRssi();
+    frame_stats.LQ_rc = rxstats.GetLQ_rc();
+    frame_stats.LQ_serial = rxstats.GetLQ_serial();
+
+    _update_rxframe_stats(&rxFrame, &frame_stats);
+}
+
+#ifdef USE_ARQ
+dbg.puts(get_fresh_payload?" TRUE":" FALSE");
+dbg.puts("\ntrs seq ");
+dbg.puts(u8toBCD_s(rxFrame.status.seq_no));
+#endif
 }
 
 
@@ -388,6 +422,19 @@ tTxFrame* frame;
         FAIL_WSTATE(BLINK_4, "rx_status failure", 0,0, link_rx1_status, link_rx2_status);
     }
 
+    // handle transmit ARQ
+    if (rx_status > RX_STATUS_INVALID) { // RX_STATUS_CRC1_VALID, RX_STATUS_VALID: we have valid information on ack
+         tarq.Received(frame->status.ack);
+    } else {
+        tarq.FrameMissed();
+    }
+
+#ifdef USE_ARQ
+dbg.puts("\nrec");
+if(tarq.status==tTransmitArq::ARQ_TX_FRAME_MISSED) dbg.puts(" FM"); else
+if(tarq.status==tTransmitArq::ARQ_TX_RECEIVED) { dbg.puts(" RC "); dbg.puts(u8toBCD_s(tarq.received_seq_no)); }
+#endif
+
     if (rx_status > RX_STATUS_INVALID) { // RX_STATUS_CRC1_VALID, RX_STATUS_VALID
 
         bool do_payload = (rx_status == RX_STATUS_VALID);
@@ -410,6 +457,11 @@ tTxFrame* frame;
 
 void handle_receive_none(void) // RX_STATUS_NONE
 {
+    tarq.FrameMissed();
+
+#ifdef USE_ARQ
+dbg.puts("\nrec FMISSED");
+#endif
 }
 
 
@@ -419,8 +471,6 @@ void do_transmit(uint8_t antenna) // we send a frame to transmitter
         bind.do_transmit(antenna);
         return;
     }
-
-    stats.transmit_seq_no++;
 
     prepare_transmit_frame(antenna);
 
@@ -536,6 +586,7 @@ RESTARTCONTROLLER
     rxstats.Init(Config.LQAveragingPeriod);
     rdiversity.Init();
     tdiversity.Init(Config.frame_rate_ms);
+    tarq.Init();
 
     out.Configure(Setup.Rx.OutMode);
     mavlink.Init();
@@ -686,6 +737,12 @@ IF_SX2(
     if (doPostReceive) {
         doPostReceive = false;
 
+#if USE_ARQ_RX_SIM_MISS > 0 && defined USE_ARQ
+static uint8_t miss_cnt = 0;
+DECc(miss_cnt,USE_ARQ_RX_SIM_MISS);
+if(!miss_cnt) { link_rx1_status = link_rx2_status = RX_STATUS_NONE; }
+#endif
+
         bool frame_received, valid_frame_received, invalid_frame_received;
         if (USE_ANTENNA1 && USE_ANTENNA2) {
             frame_received = (link_rx1_status > RX_STATUS_NONE) || (link_rx2_status > RX_STATUS_NONE);
@@ -793,6 +850,8 @@ dbg.puts(s8toBCD_s(stats.last_rssi2));*/
             sx.SetToIdle();
             sx2.SetToIdle();
         }
+
+        if (!connected()) tarq.Disconnected();
 
         DECc(tick_1hz_commensurate, Config.frame_rate_hz);
         if (!tick_1hz_commensurate) {
